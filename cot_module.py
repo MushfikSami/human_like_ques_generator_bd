@@ -1,152 +1,176 @@
 """
-cot_module.py — Chain-of-Thought & Self-Reflection
+cot_module.py — Judge, Quality Checks & Deduplication
 
-Implements the anti-AI-tone enforcement layer. After initial question
-generation, this module:
-  1. Parses the <draft_questions> and <reflection> XML blocks from the LLM output.
-  2. Evaluates the reflection verdict.
-  3. If the reflection flags AI-sounding language, builds a rewrite prompt
-     for a second pass within the same generation cycle.
-  4. Returns the final question text and full CoT log for auditing.
+Anti-AI-tone enforcement, redesigned so grading is actually meaningful:
+
+  1. `parse_draft`            — pull the questions out of the generator output.
+  2. `programmatic_checks`    — deterministic gates: Bengali-script ratio +
+                                a trimmed, Bengali-aware banned-phrase list.
+  3. `build_cot_prompt`       — a SEPARATE judge LLM call (not self-grading in
+                                the same completion) that returns structured
+                                JSON {verdict, reasons, is_bengali}.
+  4. `parse_judge`            — parse that JSON robustly.
+  5. `build_rewrite_prompt`   — second-pass rewrite when a gate/judge fails.
+  6. `dedup_hash`             — normalized hash for near-duplicate detection.
+
+The old approach (a) had the model grade itself in the same call — which almost
+always self-reported PASS — and (b) banned English words that never appear in
+Bengali output. Both are fixed here.
 """
 
 import re
 import json
+import hashlib
 import logging
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
-# ─── Banned Words List ───────────────────────────────────────────────────────
-# If any of these appear in the generated questions, the output is flagged
-# as AI-sounding regardless of the model's own reflection verdict.
+# Unicode Bengali block: U+0980–U+09FF.
+_BENGALI_RE = re.compile(r"[ঀ-৿]")
+# "Word-ish" characters we count toward the language ratio denominator
+# (Bengali + Latin letters + digits); whitespace/punctuation are ignored.
+_ALNUM_RE = re.compile(r"[ঀ-৿A-Za-z0-9]")
 
-BANNED_WORDS = [
-    "delve", "crucial", "furthermore", "comprehensive", "facilitate",
-    "in order to", "it is important to note", "i would like to inquire",
-    "i hope this message finds you well", "pertaining to", "subsequently",
-    "utilize", "regarding", "hence", "therefore", "nevertheless",
-    "accordingly", "moreover", "whilst",
+# Bengali formal/officialese phrases that betray AI/bureaucratic register.
+# These DO occur in Bengali output, unlike the old English list.
+BANNED_BENGALI_PHRASES = [
+    "অনুগ্রহপূর্বক", "এতদ্বারা", "উক্ত বিষয়ে", "মহোদয়", "সম্মানিত",
+    "বিনীত অনুরোধ", "সদয় অবগতি", "প্রসঙ্গে জানানো যাচ্ছে", "স্মারকে",
+]
+# A few English tells that would look wrong inside a phone-typed Bengali message.
+BANNED_ENGLISH_PHRASES = [
+    "i would like to inquire", "i hope this message finds you well",
+    "kindly", "furthermore", "please be advised",
 ]
 
-# ─── XML Parsing ─────────────────────────────────────────────────────────────
+
+# ─── Parsing ─────────────────────────────────────────────────────────────────
 
 def _extract_tag(text: str, tag: str) -> str | None:
+    match = re.search(rf"<{tag}>(.*?)</{tag}>", text, re.DOTALL)
+    return match.group(1).strip() if match else None
+
+
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Reasoning-model preambles that sometimes leak when the model skips the tags.
+_REASONING_PREAMBLE_RE = re.compile(
+    r"^(here'?s?\s+(a|my)\s+thinking\s+process|let me think|okay,?\s+so).*",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_draft(llm_response: str) -> str:
     """
-    Extract content between <tag> and </tag> from text.
+    Extract the questions from a generator response.
 
-    Args:
-        text: The full LLM response text.
-        tag: The XML tag name (without angle brackets).
-
-    Returns:
-        The content between the tags, or None if not found.
+    Strips reasoning-model `<think>` blocks first, then uses the LAST
+    <draft_questions> block if present. If no tags are found, returns an empty
+    string rather than leaking the model's reasoning monologue — the caller's
+    quality gate will then correctly fail and trigger a rewrite.
     """
-    pattern = rf"<{tag}>(.*?)</{tag}>"
-    match = re.search(pattern, text, re.DOTALL)
-    if match:
-        return match.group(1).strip()
-    return None
+    cleaned = _THINK_RE.sub("", llm_response).strip()
+
+    all_drafts = re.findall(r"<draft_questions>(.*?)</draft_questions>",
+                            cleaned, re.DOTALL)
+    if all_drafts:
+        return all_drafts[-1].strip()
+
+    # No tags. If the response is clearly a reasoning monologue, drop it so it
+    # doesn't get persisted as the "question".
+    if _REASONING_PREAMBLE_RE.match(cleaned):
+        logger.warning("No <draft_questions> tags and response looks like reasoning; discarding.")
+        return ""
+
+    logger.warning("No <draft_questions> tags found; using cleaned response.")
+    return cleaned
 
 
-def _contains_banned_words(text: str) -> list[str]:
-    """
-    Check if the text contains any banned AI-sounding words/phrases.
+# ─── Deterministic Quality Gates ─────────────────────────────────────────────
 
-    Args:
-        text: The question text to check.
+def bengali_ratio(text: str) -> float:
+    """Fraction of alphanumeric characters that are Bengali script (0.0-1.0)."""
+    alnum = _ALNUM_RE.findall(text)
+    if not alnum:
+        return 0.0
+    bengali = _BENGALI_RE.findall(text)
+    return len(bengali) / len(alnum)
 
-    Returns:
-        List of banned words found (empty if clean).
-    """
-    text_lower = text.lower()
-    found = []
-    for word in BANNED_WORDS:
-        if word in text_lower:
-            found.append(word)
+
+def _find_banned(text: str) -> list[str]:
+    lower = text.lower()
+    found = [p for p in BANNED_ENGLISH_PHRASES if p in lower]
+    found += [p for p in BANNED_BENGALI_PHRASES if p in text]
     return found
 
 
-# ─── CoT Prompt Builder ─────────────────────────────────────────────────────
+def programmatic_checks(text: str, min_bengali_ratio: float) -> tuple[bool, dict]:
+    """
+    Run deterministic quality gates on the question text.
 
-REWRITE_PROMPT_TEMPLATE = """The previous draft questions were flagged as not meeting quality standards.
+    Returns:
+        (ok, flags) where ok is True if all gates pass and flags is a dict
+        recording the measured values / violations for auditing.
+    """
+    ratio = bengali_ratio(text)
+    banned = _find_banned(text)
+    empty = len(text.strip()) == 0
 
-PROBLEMS IDENTIFIED:
-{problems}
+    ok = (not empty) and ratio >= min_bengali_ratio and not banned
+    flags = {
+        "bengali_ratio": round(ratio, 3),
+        "banned_phrases": banned,
+        "empty": empty,
+        "programmatic_pass": ok,
+    }
+    return ok, flags
 
-ORIGINAL DRAFT:
-{draft}
 
-PERSONA CONTEXT:
-- Profession: {profession}
-- Location: {location}
-- Education: {education}
+# ─── Judge Call (separate LLM completion) ────────────────────────────────────
 
-REWRITE INSTRUCTIONS:
-1. ALL questions MUST be in Bengali (বাংলা) script — NOT English transliteration
-2. Make it sound MUCH more human and raw
-3. Use informal Bengali as this persona would actually type on their phone
-4. Use regional dialect words where appropriate
-5. Remove ANY formal phrasing completely
-6. Some English words like NID, online, SMS, app are OK to mix in
-7. Think: "Would this person REALLY type this on their phone in Bengali?"
-
-Generate the rewritten questions in <draft_questions> tags:"""
+def _persona_fields(persona: dict) -> tuple[str, str, str]:
+    if isinstance(persona.get("json_metadata"), dict):
+        meta = persona["json_metadata"]
+    elif isinstance(persona.get("json_metadata"), str):
+        meta = json.loads(persona["json_metadata"])
+    else:
+        meta = persona or {}
+    return (
+        meta.get("profession", (persona or {}).get("profession", "unknown")),
+        meta.get("location", (persona or {}).get("location", "unknown")),
+        meta.get("education", "unknown"),
+    )
 
 
 def build_cot_prompt(draft_questions: str, persona: dict) -> list[dict]:
     """
-    Build a Chain-of-Thought reflection prompt for evaluating draft questions.
+    Build a SEPARATE judge prompt that scores the draft and returns JSON.
 
-    Forces the model to output a <reflection> block that checks:
-    - Check 1: AI-sounding language detection
-    - Check 2: Profession/location authenticity match
-    - Check 3: Politeness level check
-
-    Args:
-        draft_questions: The raw draft questions text from the initial generation.
-        persona: Dict with persona details (profession, location, education, etc.).
-
-    Returns:
-        OpenAI-compatible messages list for the reflection call.
+    A distinct completion (rather than self-grading inside the generator call)
+    makes the verdict far less likely to be a rubber-stamp PASS.
     """
-    # Extract persona details
-    if "json_metadata" in persona and isinstance(persona["json_metadata"], dict):
-        metadata = persona["json_metadata"]
-    elif "json_metadata" in persona and isinstance(persona["json_metadata"], str):
-        metadata = json.loads(persona["json_metadata"])
-    else:
-        metadata = persona
+    profession, location, education = _persona_fields(persona)
 
-    profession = metadata.get("profession", persona.get("profession", "unknown"))
-    location = metadata.get("location", persona.get("location", "unknown"))
-    education = metadata.get("education", "unknown")
-
-    system_content = """You are a quality checker for human-like question generation in Bengali (বাংলা). Your job is to evaluate whether generated questions sound authentically human or like AI-generated text, and whether they are properly written in Bengali script.
-
-You MUST output a <reflection> block with these exact checks:
-
-<reflection>
-Check 1 — AI Detection: Does this sound like an AI wrote it? Are there overly formal transition words, perfect grammar, or unnaturally structured sentences?
-Check 2 — Persona Match: Is this EXACTLY how a {profession} from {location} with {education} education would type this on a phone? Would they really use these words?
-Check 3 — Politeness Check: Is it too polite? Does the tone match real frustrated/confused users?
-Check 4 — Language Check: Is the output in Bengali (বাংলা) script? NOT English transliteration? Some English words like NID, online, SMS are acceptable.
-Verdict: [PASS / FAIL]
-Reason: [explain if FAIL]
-</reflection>
-
-If FAIL, rewrite the questions in Bengali (বাংলা) with a more raw, human tone in <draft_questions> tags.""".format(
-        profession=profession, location=location, education=education
+    system_content = (
+        "You are a strict reviewer of Bengali (বাংলা) chatbot questions supposedly "
+        "typed by real Bangladeshi citizens on their phones. Judge authenticity "
+        "harshly — most AI-written text is too clean, too polite, and too "
+        "well-structured. Respond with ONLY a JSON object, no prose."
     )
 
-    user_content = f"""Evaluate these draft questions for authenticity and Bengali language compliance:
+    user_content = f"""Persona: a {profession} from {location} with {education} education.
 
-<draft_questions>
+Draft questions:
 {draft_questions}
-</draft_questions>
 
-This was written for a persona who is a {profession} from {location} with {education} education.
+Judge whether these read as authentically typed by THIS person on a phone.
+Fail if: overly formal/polite, unnaturally structured, perfect grammar, sounds
+AI-written, or not genuinely in Bengali script.
 
-Check if it sounds human enough AND is properly in Bengali (বাংলা) script. Output your <reflection> and if needed, a rewritten <draft_questions> in Bengali."""
+Return ONLY this JSON:
+{{"verdict": "PASS" or "FAIL", "is_bengali": true or false, "reasons": ["..."]}}
+
+/no_think"""
 
     return [
         {"role": "system", "content": system_content},
@@ -154,121 +178,128 @@ Check if it sounds human enough AND is properly in Bengali (বাংলা) scr
     ]
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+_VERDICT_RE = re.compile(r"verdict\W{0,4}(PASS|FAIL)", re.IGNORECASE)
+_ISBENGALI_RE = re.compile(r"is_bengali\W{0,4}(true|false)", re.IGNORECASE)
+
+
+def _iter_brace_objects(text: str):
+    """Yield balanced-brace {...} substrings, so we don't greedily merge two."""
+    depth = 0
+    start = None
+    for i, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth > 0:
+            depth -= 1
+            if depth == 0 and start is not None:
+                yield text[start:i + 1]
+                start = None
+
+
+def _coerce_result(data: dict) -> dict:
+    verdict = str(data.get("verdict", "PASS")).upper()
+    return {
+        "verdict": "FAIL" if verdict == "FAIL" else "PASS",
+        "is_bengali": bool(data.get("is_bengali", True)),
+        "reasons": data.get("reasons", []) or [],
+    }
+
+
+def parse_judge(judge_response: str) -> dict:
+    """
+    Parse the judge's verdict robustly.
+
+    Strategy (each falls through to the next):
+      1. Strip <think> blocks and markdown code fences.
+      2. Try json.loads on each balanced {...} object found.
+      3. Regex-recover `verdict` / `is_bengali` directly from the text, so a
+         malformed-JSON reply still yields a real verdict instead of a blind PASS.
+      4. Only if nothing at all is found, default to a lenient PASS (the
+         deterministic programmatic gates still apply either way).
+
+    Returns a dict with keys: verdict (PASS/FAIL), is_bengali (bool), reasons (list).
+    """
+    text = _THINK_RE.sub("", judge_response or "").strip()
+
+    # Prefer content inside a ```json ... ``` fence if present.
+    fence = _FENCE_RE.search(text)
+    scan = fence.group(1) if fence else text
+
+    # 2. Try real JSON on each balanced object.
+    for candidate in _iter_brace_objects(scan):
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict):
+                return _coerce_result(data)
+        except json.JSONDecodeError:
+            continue
+
+    # 3. Regex recovery — pull the fields out even if the JSON is malformed.
+    verdict_m = _VERDICT_RE.search(text)
+    bengali_m = _ISBENGALI_RE.search(text)
+    if verdict_m or bengali_m:
+        logger.warning("Judge JSON unparseable; recovered fields via regex.")
+        return {
+            "verdict": verdict_m.group(1).upper() if verdict_m else "PASS",
+            "is_bengali": (bengali_m.group(1).lower() == "true") if bengali_m else True,
+            "reasons": ["recovered from malformed judge json"],
+        }
+
+    # 4. Nothing usable.
+    logger.warning("Judge returned no usable verdict; defaulting to PASS.")
+    return {"verdict": "PASS", "is_bengali": True, "reasons": ["unparseable judge"]}
+
+
+# ─── Rewrite Prompt ──────────────────────────────────────────────────────────
+
+REWRITE_PROMPT_TEMPLATE = """The previous draft was rejected.
+
+PROBLEMS:
+{problems}
+
+ORIGINAL DRAFT:
+{draft}
+
+PERSONA: {profession} from {location}, {education} education.
+
+Rewrite the questions so they read like THIS person really typed them on a phone:
+1. ALL questions in Bengali (বাংলা) script — NOT transliteration
+2. Raw, informal, imperfect — fragments and run-ons are good
+3. Regional/dialect flavour where it fits; not polite or formal
+4. English words like NID, online, SMS, app may be mixed in
+
+Output ONLY the rewritten questions inside <draft_questions> tags.
+
+/no_think"""
+
+
 def build_rewrite_prompt(draft_questions: str, problems: str, persona: dict) -> list[dict]:
-    """
-    Build a rewrite prompt when the draft questions fail the CoT reflection.
-
-    Args:
-        draft_questions: The flagged draft questions.
-        problems: Description of the problems found.
-        persona: Dict with persona details.
-
-    Returns:
-        OpenAI-compatible messages list for the rewrite call.
-    """
-    if "json_metadata" in persona and isinstance(persona["json_metadata"], dict):
-        metadata = persona["json_metadata"]
-    elif "json_metadata" in persona and isinstance(persona["json_metadata"], str):
-        metadata = json.loads(persona["json_metadata"])
-    else:
-        metadata = persona
-
-    profession = metadata.get("profession", persona.get("profession", "unknown"))
-    location = metadata.get("location", persona.get("location", "unknown"))
-    education = metadata.get("education", "unknown")
-
+    """Build a rewrite prompt when a draft fails the gates/judge."""
+    profession, location, education = _persona_fields(persona)
     user_content = REWRITE_PROMPT_TEMPLATE.format(
-        problems=problems,
-        draft=draft_questions,
-        profession=profession,
-        location=location,
-        education=education,
+        problems=problems, draft=draft_questions,
+        profession=profession, location=location, education=education,
     )
-
     return [
-        {"role": "system", "content": "You rewrite AI-sounding text to sound like a real human typed it on their phone in Bengali (বাংলা). Output ONLY the rewritten questions in Bengali script in <draft_questions> tags. No explanations. Some English words like NID, online, SMS are OK to mix in."},
+        {"role": "system",
+         "content": "You rewrite text to sound like a real person typed it on a "
+                    "phone in Bengali (বাংলা). Output ONLY <draft_questions> tags."},
         {"role": "user", "content": user_content},
     ]
 
 
-def validate_and_refine(llm_response: str, persona: dict = None) -> tuple[str, str]:
+# ─── Deduplication ───────────────────────────────────────────────────────────
+
+def dedup_hash(text: str) -> str:
     """
-    Parse the LLM response, validate via reflection, and return final output.
+    Normalized hash for near-duplicate detection.
 
-    Workflow:
-    1. Extract <draft_questions> and <reflection> from the response.
-    2. Run an additional banned-word check on the draft questions.
-    3. If the reflection verdict is FAIL or banned words are found,
-       flag for rewrite (the caller handles the actual LLM re-call).
-    4. Return the final question text and full CoT log.
-
-    Args:
-        llm_response: The full text response from the LLM.
-        persona: Optional persona dict for context in the CoT log.
-
-    Returns:
-        Tuple of (final_question_text, cot_log).
-        If the reflection fails, the cot_log will contain "NEEDS_REWRITE"
-        as a signal to the caller.
+    Lowercases, strips punctuation/whitespace runs and Unicode-normalizes so
+    trivially different phrasings of the same question collide.
     """
-    cot_log_parts = []
-    cot_log_parts.append("=== RAW LLM RESPONSE ===")
-    cot_log_parts.append(llm_response)
-    cot_log_parts.append("")
-
-    # Extract the draft questions (use the LAST <draft_questions> block,
-    # since a FAIL reflection may produce a rewrite)
-    all_drafts = re.findall(r"<draft_questions>(.*?)</draft_questions>",
-                            llm_response, re.DOTALL)
-
-    if not all_drafts:
-        logger.warning("No <draft_questions> tags found in LLM response.")
-        cot_log_parts.append("WARNING: No <draft_questions> tags found.")
-        # Fall back to using the entire response as the question
-        question_text = llm_response.strip()
-        cot_log = "\n".join(cot_log_parts)
-        return question_text, cot_log
-
-    # Use the last draft (post-rewrite if applicable)
-    draft_questions = all_drafts[-1].strip()
-
-    # Extract reflection
-    reflection = _extract_tag(llm_response, "reflection")
-    if reflection:
-        cot_log_parts.append("=== REFLECTION ===")
-        cot_log_parts.append(reflection)
-        cot_log_parts.append("")
-
-    # Check for banned words in the draft
-    banned_found = _contains_banned_words(draft_questions)
-    if banned_found:
-        cot_log_parts.append(f"=== BANNED WORDS DETECTED: {', '.join(banned_found)} ===")
-
-    # Determine if the output passes
-    needs_rewrite = False
-    rewrite_reasons = []
-
-    # Check reflection verdict
-    if reflection:
-        verdict_match = re.search(r"Verdict:\s*(PASS|FAIL)", reflection, re.IGNORECASE)
-        if verdict_match and verdict_match.group(1).upper() == "FAIL":
-            needs_rewrite = True
-            reason_match = re.search(r"Reason:\s*(.*?)$", reflection, re.MULTILINE)
-            if reason_match:
-                rewrite_reasons.append(f"Reflection: {reason_match.group(1).strip()}")
-
-    # Check for banned words
-    if banned_found:
-        needs_rewrite = True
-        rewrite_reasons.append(f"Banned words found: {', '.join(banned_found)}")
-
-    if needs_rewrite:
-        cot_log_parts.append("=== VERDICT: NEEDS_REWRITE ===")
-        cot_log_parts.append("Reasons: " + "; ".join(rewrite_reasons))
-        cot_log = "\n".join(cot_log_parts)
-        # Return the draft but signal the caller to rewrite
-        return draft_questions, "NEEDS_REWRITE|" + cot_log
-    else:
-        cot_log_parts.append("=== VERDICT: PASS ===")
-        cot_log = "\n".join(cot_log_parts)
-        return draft_questions, cot_log
+    norm = unicodedata.normalize("NFKC", text).lower()
+    norm = re.sub(r"[^ঀ-৿a-z0-9]+", " ", norm).strip()
+    return hashlib.sha1(norm.encode("utf-8")).hexdigest()

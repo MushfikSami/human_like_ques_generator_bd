@@ -1,12 +1,21 @@
 """
 persona_generator.py — Matrix-Driven Persona Creation
 
-Generates diverse Bangladeshi personas using weighted random sampling across
-demographic dimensions: region, profession, age, gender, social status,
-education level, and government-service pain points.
+Generates diverse Bangladeshi personas across demographic dimensions: region,
+profession, age, gender, social status, education level, and government-service
+pain points.
+
+Coverage strategy:
+  * `profession`, `pain_point`, and `education` are placed in a deterministic
+    co-prime striding matrix (see _stratified_cells) so every value on each of
+    those three axes is evenly covered.
+  * `location` is sampled *probabilistically* from REGION_WEIGHTS so the national
+    distribution stays realistic (Dhaka Metro dominant) while still surfacing
+    hyper-local/marginalized environments (slums, camps, char areas).
+  * `age`, `gender`, `social_status` are weighted-sampled per persona.
 
 Each persona is assigned a unique random_seed for reproducibility — the same
-seed should produce the same LLM output when used during question generation.
+seed always produces the same persona.
 """
 
 import json
@@ -22,6 +31,11 @@ logger = logging.getLogger(__name__)
 # demographic landscape, weighted towards populations most likely to interact
 # with government services.
 
+# Regions are sampled probabilistically (see REGION_WEIGHTS) rather than strided,
+# so the national distribution stays realistic (Dhaka Metro dominant) while still
+# surfacing hyper-local / marginalized environments. REGIONS and REGION_WEIGHTS
+# MUST stay the same length and order. Weights are relative — rng.choices
+# normalizes them — so they need not sum to any particular total.
 REGIONS = [
     # Divisions / major cities
     "Dhaka", "Chattogram", "Rajshahi", "Khulna", "Sylhet",
@@ -41,7 +55,39 @@ REGIONS = [
     # Special / rural areas
     "Chittagong Hill Tracts", "Sundarbans adjacent area", "Char areas (Jamuna)",
     "Haor region (Sunamganj)", "Coastal belt (Bhola)",
+    # Hyper-local / marginalized environments
+    "Korail Slum (Dhaka)", "Bhashantek Bosti (Dhaka)", "Geneva Camp (Mohammadpur)",
+    "Railway Colony (Chattogram)", "Sitakunda Shipbreaking Yard Area",
+    "Char areas of Kurigram",
 ]
+
+REGION_WEIGHTS = [
+    # Divisions / major cities — Dhaka Metro dominant (~25% of total weight)
+    25.0, 10.0, 5.0, 5.0, 4.0,
+    4.0, 3.5, 3.5,
+    # Districts & notable areas — a couple of larger metro-adjacent ones higher,
+    # ordinary districts ~1 each
+    2.5, 3.0, 3.0, 2.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 1.0,
+    # Special / rural areas
+    1.0, 1.0, 1.5, 1.5, 1.5,
+    # Hyper-local / marginalized environments — small but non-trivial shares
+    3.0, 2.0, 1.5, 1.5, 2.0,
+    2.0,
+]
+
+assert len(REGIONS) == len(REGION_WEIGHTS), (
+    f"REGIONS ({len(REGIONS)}) and REGION_WEIGHTS ({len(REGION_WEIGHTS)}) must match"
+)
 
 PROFESSIONS = [
     # Informal / rural
@@ -61,6 +107,14 @@ PROFESSIONS = [
     # Tech / modern
     "tech startup employee", "freelance web developer", "Uber/Pathao driver",
     "e-commerce seller", "social media manager", "call centre agent",
+    # Gig economy / micro-professions
+    "Foodpanda/Pathao food delivery rider", "F-commerce (Facebook Live) clothing seller",
+    "mobile banking (bKash/Nagad) agent", "freelance graphic designer (Upwork/Fiverr)",
+    "YouTube/TikTok regional content creator", "Hijra (transgender) community member",
+    # Non-Resident Bangladeshis (NRBs) & migrants
+    "construction worker in Dubai (UAE)", "palm oil plantation worker in Malaysia",
+    "convenience store clerk in Saudi Arabia", "student studying in North America/UK",
+    "returnee migrant worker",
     # Specific demographics
     "expatriate worker's wife", "retired army personnel", "widow on pension",
     "disabled person (on social safety net)", "domestic worker",
@@ -97,6 +151,14 @@ PAIN_POINTS = [
     # Migration & foreign
     "BMET registration", "foreign employment visa", "remittance issue",
     "embassy appointment",
+    # Modern digital services
+    "Universal Pension Scheme (Prottoy/Surokkha) enrollment",
+    "e-TIN registration and zero-return submission",
+    "BDRIS (Birth and Death Registration) server downtime",
+    "BRTA smart driving license biometric delay",
+    "Probashi Kallyan Bank loan application",
+    "reporting bKash fraud / cybercrime to DB police",
+    "dual citizenship certificate for e-Passport",
 ]
 
 GENDERS = ["male", "female", "other"]
@@ -165,7 +227,7 @@ def _weighted_choice(items, weights=None):
     return random.choice(items)
 
 
-def _generate_single_persona(seed: int) -> dict:
+def _generate_single_persona(seed: int, forced_cell: tuple = None) -> dict:
     """
     Generate a single persona dict using the given random seed.
 
@@ -174,6 +236,11 @@ def _generate_single_persona(seed: int) -> dict:
 
     Args:
         seed: Unique random seed for this persona.
+        forced_cell: Optional (profession, pain_point, education) triple assigned
+            by the stratified coverage planner. When provided, those three
+            dimensions are fixed; when None, they are weighted-sampled from the
+            seed (legacy path). `location` is always sampled probabilistically
+            from REGION_WEIGHTS regardless of this argument.
 
     Returns:
         Dict with all persona fields ready for DB insertion.
@@ -184,11 +251,17 @@ def _generate_single_persona(seed: int) -> dict:
     age_range = rng.choices(AGE_RANGES, weights=AGE_WEIGHTS, k=1)[0]
     age = rng.randint(age_range[0], age_range[1])
     gender = rng.choices(GENDERS, weights=GENDER_WEIGHTS, k=1)[0]
-    location = rng.choice(REGIONS)
-    profession = rng.choice(PROFESSIONS)
     social_status = rng.choices(SOCIAL_STATUSES, weights=SOCIAL_STATUS_WEIGHTS, k=1)[0]
-    education = rng.choices(EDUCATION_LEVELS, weights=EDUCATION_WEIGHTS, k=1)[0]
-    pain_point = rng.choice(PAIN_POINTS)
+
+    # Region is always weighted-probabilistic (not part of the striding matrix).
+    location = rng.choices(REGIONS, weights=REGION_WEIGHTS, k=1)[0]
+
+    if forced_cell is not None:
+        profession, pain_point, education = forced_cell
+    else:
+        profession = rng.choice(PROFESSIONS)
+        pain_point = rng.choice(PAIN_POINTS)
+        education = rng.choices(EDUCATION_LEVELS, weights=EDUCATION_WEIGHTS, k=1)[0]
 
     # Build backstory
     education_detail = f"Education: {education}."
@@ -232,36 +305,83 @@ def _generate_single_persona(seed: int) -> dict:
     }
 
 
+def _stratified_cells(count: int, rng: random.Random):
+    """
+    Build a coverage-driven list of (profession, pain_point, education) cells.
+
+    Rather than sampling each dimension independently (which leaves large parts
+    of the matrix unvisited and over-samples common combinations by chance), we
+    walk the PROFESSIONS × PAIN_POINTS × EDUCATION_LEVELS space with co-prime
+    striding so the `count` personas spread evenly across all three dimensions.
+
+    Region is intentionally NOT strided here — it is sampled probabilistically
+    from REGION_WEIGHTS in _generate_single_persona to keep a realistic national
+    distribution.
+
+    The multipliers (7, 13, 11) must each stay coprime with their array length
+    for even coverage; this holds for the current array sizes (62 professions,
+    55 pain points, 9 education levels).
+
+    Args:
+        count: Number of cells to produce.
+        rng: Seeded RNG for reproducible shuffling.
+
+    Returns:
+        List of (profession, pain_point, education) tuples of length `count`.
+    """
+    professions = PROFESSIONS[:]
+    pains = PAIN_POINTS[:]
+    educations = EDUCATION_LEVELS[:]
+    rng.shuffle(professions)
+    rng.shuffle(pains)
+    rng.shuffle(educations)
+
+    cells = []
+    for i in range(count):
+        profession = professions[(i * 7) % len(professions)]
+        pain = pains[(i * 13) % len(pains)]
+        education = educations[(i * 11) % len(educations)]
+        cells.append((profession, pain, education))
+    return cells
+
+
 def generate_personas(count: int = 25000):
     """
-    Generate `count` diverse Bangladeshi personas and insert them into the DB.
+    Generate `count` diverse Bangladeshi personas and bulk-insert them.
 
-    Uses unique random seeds to ensure each persona is reproducible.
-    Personas are inserted one-by-one with transactional safety so the
-    process can be interrupted and resumed.
+    Coverage-driven: the profession / pain-point / education triples are laid
+    out with co-prime striding (see _stratified_cells) so those axes are evenly
+    covered. Region is weighted-probabilistic; age, gender, social status and
+    backstory are seeded per-persona for reproducibility.
 
     Args:
         count: Number of personas to generate (default 25,000).
     """
-    logger.info("Generating %d personas...", count)
+    logger.info("Generating %d personas (stratified coverage)...", count)
+    db.init_pool()
     conn = db.get_connection()
 
-    # Generate unique seeds upfront
     seed_rng = random.Random(42)  # Master seed for reproducibility
     seeds = [seed_rng.randint(0, 2**31) for _ in range(count)]
+    cells = _stratified_cells(count, random.Random(43))
 
     try:
-        for i, seed in enumerate(seeds):
-            persona = _generate_single_persona(seed)
-            persona_id = db.insert_persona(conn, persona)
+        buffer = []
+        for i, (seed, cell) in enumerate(zip(seeds, cells)):
+            persona = _generate_single_persona(seed, forced_cell=cell)
+            buffer.append(persona)
 
-            if (i + 1) % 500 == 0:
-                logger.info("Inserted %d / %d personas (latest persona_id=%d)",
-                            i + 1, count, persona_id)
+            if len(buffer) >= 500:
+                db.bulk_insert_personas(conn, buffer)
+                logger.info("Inserted %d / %d personas", i + 1, count)
+                buffer = []
+
+        if buffer:
+            db.bulk_insert_personas(conn, buffer)
 
         logger.info("Successfully generated and inserted %d personas.", count)
     except Exception:
-        logger.exception("Error during persona generation at index %d", i)
+        logger.exception("Error during persona generation.")
         raise
     finally:
-        conn.close()
+        db.put_connection(conn)

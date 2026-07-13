@@ -105,7 +105,7 @@ Ensure the project is easily maintainable and reproducible.
 
 * **Code Documentation:** Comment all Python scripts, specifically the batching logic and the DB connection pooling.
 * **Prompt Library:** Maintain a markdown file of the exact prompts used for generation and reflection.
-* **Reproducibility Guide:** Document how a developer can take a `persona_id` and `random_seed` from the database and regenerate the exact same question for debugging purposes.
+* **Reproducibility Guide:** Personas are fully reproducible from the master seed. Question generation is only *approximately* reproducible — vLLM continuous batching with temperature > 0 is not deterministic from `seed` alone — so the raw LLM response is stored in `cot_log` for exact auditability. Document how a developer regenerates a persona's question (reset `status='pending'`, delete the row, re-run `--generate --batch-size 1`). See `workflow.md` (v2) for the reworked, reliability-focused pipeline.
 
 #### **9. Final Deployment & Maintenance**
 

@@ -16,9 +16,11 @@ import asyncio
 import logging
 import sys
 
+import db
 from db import init_tables
 from persona_generator import generate_personas
 from question_generator import run
+from report import print_report
 
 
 def setup_logging():
@@ -77,6 +79,16 @@ Examples:
         help="Number of concurrent LLM calls per batch (default: 50)",
     )
     parser.add_argument(
+        "--migrate",
+        action="store_true",
+        help="Apply additive schema migrations (status/attempts/dedup columns)",
+    )
+    parser.add_argument(
+        "--report",
+        action="store_true",
+        help="Print a run report (coverage, duplicates, judge-fail, non-Bengali)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Micro-batch QA run with batch_size=100 for testing",
@@ -85,7 +97,8 @@ Examples:
     args = parser.parse_args()
 
     # Check that at least one action was requested
-    if not (args.init_db or args.gen_personas > 0 or args.generate or args.test):
+    if not (args.init_db or args.migrate or args.report or args.gen_personas > 0
+            or args.generate or args.test):
         parser.print_help()
         sys.exit(1)
 
@@ -93,7 +106,13 @@ Examples:
     if args.init_db:
         logger.info("Initialising database tables...")
         init_tables()
+        db.migrate()
         logger.info("Database tables ready.")
+
+    if args.migrate:
+        logger.info("Applying schema migrations...")
+        db.migrate()
+        logger.info("Migrations applied.")
 
     if args.gen_personas > 0:
         logger.info("Generating %d personas...", args.gen_personas)
@@ -108,6 +127,9 @@ Examples:
         logger.info("Starting full question generation (batch_size=%d)...", args.batch_size)
         asyncio.run(run(batch_size=args.batch_size))
         logger.info("Question generation complete.")
+
+    if args.report:
+        print_report()
 
 
 if __name__ == "__main__":

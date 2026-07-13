@@ -84,7 +84,7 @@ REQUIRED formatting:
 
 ## OUTPUT FORMAT
 
-Generate 1-3 questions IN BENGALI (বাংলা) and wrap them in XML tags. Also include a self-reflection block.
+Generate 1-3 questions IN BENGALI (বাংলা) and wrap them in XML tags. Output ONLY the tag block — no preamble, no explanation, no self-grading (a separate reviewer will judge quality).
 
 <draft_questions>
 [question 1 — in Bengali]
@@ -93,17 +93,6 @@ Generate 1-3 questions IN BENGALI (বাংলা) and wrap them in XML tags. A
 
 [question 3 (optional) — in Bengali]
 </draft_questions>
-
-<reflection>
-Check 1 — AI Detection: Does this sound like an AI wrote it? Overly formal transition words?
-Check 2 — Persona Match: Is this EXACTLY how a [profession] from [location] would type on a phone?
-Check 3 — Politeness Check: Is it too polite?
-Check 4 — Language Check: Is it in Bengali (বাংলা) script? NOT English transliteration?
-Verdict: [PASS / FAIL]
-Reason: [if FAIL, explain why]
-</reflection>
-
-If verdict is FAIL, rewrite with more raw/human tone in a NEW <draft_questions> block.
 
 REMEMBER: You are generating what a REAL Bangladeshi person would TYPE on their PHONE in Bengali (বাংলা). Not what an AI assistant would write. Real people make mistakes, use shortcuts, mix some English words, and don't care about grammar. The output MUST be in Bengali script."""
 
@@ -123,8 +112,9 @@ Generate the questions now IN BENGALI (বাংলা). Remember:
 - Write EXACTLY how this {profession} from {location} with {education} education would type on their phone in Bengali
 - The questions should be about: {pain_point}
 - Some English words like NID, online, SMS, app are OK to mix in
-- Include the <reflection> block after your draft
-- If reflection says FAIL, rewrite immediately"""
+- Output ONLY the <draft_questions> block — nothing else
+
+/no_think"""
 
 
 def build_prompt(persona_json: dict) -> list[dict]:

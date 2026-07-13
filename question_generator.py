@@ -1,20 +1,24 @@
 """
 question_generator.py — Core Generation Loop
 
-Processes batches of unprocessed personas from the database, sends them to the
-LLM endpoint for question generation with Chain-of-Thought self-reflection,
-and stores results in both PostgreSQL and CSV.
+Processes 'pending' personas from the database, generates Bengali questions via
+the vLLM endpoint, grades them with a separate judge call plus deterministic
+quality gates, and persists results.
 
-Uses asyncio with a semaphore to control concurrency (default 50 concurrent
-requests) to avoid overwhelming the vLLM server.
-
-The `processed` flag in the personas table ensures safe pause/resume —
-the script can be stopped and restarted without duplicating work.
+Reliability design (fixes over the previous version):
+  * Dead-letter: a persona is retried up to GEN_CONFIG["max_attempts"], then
+    marked status='failed'. The fetch loop only returns status='pending', so a
+    persistently-failing persona can never stall the full run — it terminates.
+  * Connection pool: DB work borrows from a shared ThreadedConnectionPool
+    (via asyncio.to_thread) instead of opening one connection per persona.
+  * Single writer: all DB writes and CSV appends flow through ONE writer task
+    fed by an asyncio.Queue, eliminating the concurrent-CSV corruption race.
 """
 
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime
 
 import aiohttp
@@ -22,49 +26,39 @@ import aiohttp
 import db
 import prompt_engine
 import cot_module
-from config import LLM_CONFIG
+from config import LLM_CONFIG, GEN_CONFIG
 
 logger = logging.getLogger(__name__)
 
-# Maximum number of rewrite attempts if the CoT module flags AI-sounding text
-MAX_REWRITE_ATTEMPTS = 2
+# Thinking is disabled on every call (see _call_llm), so the model emits the
+# answer directly and needs far less headroom. Bengali questions / judge JSON are
+# short; 800 tokens is ample.
+LLM_MAX_TOKENS = 800
+MAX_REWRITE_ATTEMPTS = 2  # in-cycle rewrites before giving the persona back for retry
 
-# LLM generation parameters
-LLM_TEMPERATURE = 0.8
-LLM_MAX_TOKENS = 1024
+# Sentinel to stop the writer task.
+_STOP = object()
 
 
-async def _call_llm(session: aiohttp.ClientSession, messages: list[dict],
-                     seed: int | None = None) -> str:
-    """
-    Send a chat completion request to the vLLM endpoint.
-
-    Args:
-        session: Active aiohttp session.
-        messages: OpenAI-compatible messages list.
-        seed: Optional random seed for reproducibility.
-
-    Returns:
-        The generated text content from the LLM.
-
-    Raises:
-        Exception: If the API call fails after all retries.
-    """
+async def _call_llm(session, messages, seed=None):
+    """Send a chat completion request to the vLLM endpoint with retry/backoff."""
     payload = {
         "model": LLM_CONFIG["model"],
         "messages": messages,
-        "temperature": LLM_TEMPERATURE,
+        "temperature": GEN_CONFIG["temperature"],
         "max_tokens": LLM_MAX_TOKENS,
+        # Disable qwen3's chain-of-thought so it answers directly. This is the
+        # vLLM-honored switch (the in-prompt "/no_think" text is not reliable)
+        # and cuts generated tokens ~5-10x.
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     if seed is not None:
         payload["seed"] = seed
 
-    # Retry logic for transient failures
     for attempt in range(3):
         try:
             async with session.post(
-                LLM_CONFIG["url"],
-                json=payload,
+                LLM_CONFIG["url"], json=payload,
                 timeout=aiohttp.ClientTimeout(total=120),
             ) as response:
                 if response.status != 200:
@@ -74,210 +68,262 @@ async def _call_llm(session: aiohttp.ClientSession, messages: list[dict],
                     if attempt < 2:
                         await asyncio.sleep(2 ** attempt)
                         continue
-                    raise Exception(f"LLM API error: {response.status} - {error_text}")
-
+                    raise RuntimeError(f"LLM API error: {response.status}")
                 result = await response.json()
                 return result["choices"][0]["message"]["content"]
-
-        except asyncio.TimeoutError:
-            logger.warning("LLM call timed out (attempt %d/3)", attempt + 1)
-            if attempt < 2:
-                await asyncio.sleep(2 ** attempt)
-                continue
-            raise
-        except aiohttp.ClientError as e:
-            logger.warning("LLM connection error (attempt %d/3): %s", attempt + 1, e)
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            logger.warning("LLM call failed (attempt %d/3): %s", attempt + 1, e)
             if attempt < 2:
                 await asyncio.sleep(2 ** attempt)
                 continue
             raise
 
 
-async def generate_for_persona(session: aiohttp.ClientSession,
-                                semaphore: asyncio.Semaphore,
-                                persona: dict,
-                                db_conn) -> bool:
+def _metadata(persona: dict) -> dict:
+    md = persona.get("json_metadata")
+    if isinstance(md, str):
+        return json.loads(md)
+    if isinstance(md, dict):
+        return md
+    return {}
+
+
+# ─── Per-persona pipeline ────────────────────────────────────────────────────
+
+async def generate_for_persona(session, semaphore, persona, out_queue, seen_hashes):
     """
-    Full generation pipeline for a single persona.
+    Generate, grade, and (on success) enqueue one persona's question.
 
-    Steps:
-    1. Build the prompt with persona details.
-    2. Call the LLM with the persona's random_seed.
-    3. Validate via CoT self-reflection.
-    4. If flagged, attempt rewrites (up to MAX_REWRITE_ATTEMPTS).
-    5. Save the final question and CoT log to DB + CSV.
-
-    Args:
-        session: Active aiohttp session for LLM calls.
-        semaphore: Concurrency limiter.
-        persona: Dict with persona details from the database.
-        db_conn: Active psycopg2 connection.
-
-    Returns:
-        True if generation succeeded, False otherwise.
+    Returns one of: "done", "retry", "failed" — the run loop uses this to
+    decide DB status transitions.
     """
     persona_id = persona["persona_id"]
-
-    # Extract random_seed from json_metadata
-    if isinstance(persona.get("json_metadata"), str):
-        metadata = json.loads(persona["json_metadata"])
-    elif isinstance(persona.get("json_metadata"), dict):
-        metadata = persona["json_metadata"]
-    else:
-        metadata = {}
-
-    random_seed = metadata.get("random_seed", persona_id)
+    meta = _metadata(persona)
+    random_seed = meta.get("random_seed", persona_id)
 
     async with semaphore:
         try:
-            # Step 1: Build the initial prompt
+            # 1. Generate draft
             messages = prompt_engine.build_prompt(persona)
+            logger.info("Generating persona_id=%d (%s / %s)", persona_id,
+                        persona.get("profession", "?"), persona.get("location", "?"))
+            response = await _call_llm(session, messages, seed=random_seed)
+            draft = cot_module.parse_draft(response)
 
-            # Step 2: Call the LLM
-            logger.info("Generating questions for persona_id=%d (%s from %s)",
-                        persona_id, persona.get("profession", "?"),
-                        persona.get("location", "?"))
+            cot_parts = [f"=== RAW ===\n{response}"]
 
-            llm_response = await _call_llm(session, messages, seed=random_seed)
+            # 2. Gate + judge, with in-cycle rewrites
+            final_text = draft
+            quality_flags = {}
+            for rw in range(MAX_REWRITE_ATTEMPTS + 1):
+                ok, flags = cot_module.programmatic_checks(
+                    final_text, GEN_CONFIG["min_bengali_ratio"])
+                judge_raw = await _call_llm(
+                    session, cot_module.build_cot_prompt(final_text, persona),
+                    seed=random_seed + 1000 + rw)
+                judge = cot_module.parse_judge(judge_raw)
+                quality_flags = {**flags, "judge": judge}
+                cot_parts.append(
+                    f"=== GATE {rw} ===\n{flags}\n=== JUDGE {rw} (raw) ===\n{judge_raw}\n"
+                    f"=== JUDGE {rw} (parsed) ===\n{judge}")
 
-            # Step 3: Validate and refine via CoT
-            question_text, cot_log = cot_module.validate_and_refine(llm_response, persona)
+                passed = ok and judge["verdict"] == "PASS" and judge["is_bengali"]
+                if passed or rw == MAX_REWRITE_ATTEMPTS:
+                    break
 
-            # Step 4: Handle rewrites if needed
-            rewrite_count = 0
-            full_cot_log = cot_log
+                # rewrite
+                problems = "; ".join(judge["reasons"]) or str(flags)
+                rewrite_msgs = cot_module.build_rewrite_prompt(final_text, problems, persona)
+                rw_resp = await _call_llm(session, rewrite_msgs, seed=random_seed + 2000 + rw)
+                final_text = cot_module.parse_draft(rw_resp)
+                cot_parts.append(f"=== REWRITE {rw} ===\n{rw_resp}")
 
-            while cot_log.startswith("NEEDS_REWRITE|") and rewrite_count < MAX_REWRITE_ATTEMPTS:
-                rewrite_count += 1
-                logger.info("Rewriting for persona_id=%d (attempt %d/%d)",
-                            persona_id, rewrite_count, MAX_REWRITE_ATTEMPTS)
+            # 3. Dedup flag
+            dh = cot_module.dedup_hash(final_text)
+            is_dup = dh in seen_hashes
+            seen_hashes.add(dh)
+            quality_flags["duplicate"] = is_dup
 
-                # Extract the actual cot_log (after the NEEDS_REWRITE| prefix)
-                actual_cot = cot_log.split("|", 1)[1]
-
-                # Build the rewrite prompt
-                rewrite_messages = cot_module.build_rewrite_prompt(
-                    question_text,
-                    f"Rewrite attempt {rewrite_count}",
-                    persona,
-                )
-
-                # Call the LLM again for rewrite
-                rewrite_response = await _call_llm(session, rewrite_messages, seed=random_seed + rewrite_count)
-                question_text, cot_log = cot_module.validate_and_refine(rewrite_response, persona)
-
-                full_cot_log += f"\n\n=== REWRITE ATTEMPT {rewrite_count} ===\n{cot_log}"
-
-            # Clean the final cot_log (remove NEEDS_REWRITE prefix if still present)
-            if full_cot_log.startswith("NEEDS_REWRITE|"):
-                full_cot_log = full_cot_log.split("|", 1)[1]
-                logger.warning("persona_id=%d still flagged after %d rewrites, saving anyway.",
-                               persona_id, MAX_REWRITE_ATTEMPTS)
-
-            # Step 5: Save to DB and CSV
-            db.save_question(db_conn, persona_id, question_text, full_cot_log, random_seed)
-
-            # Build CSV row with combined persona + question data
-            csv_row = {
+            # 4. Enqueue for the single writer
+            await out_queue.put({
+                "persona": persona,
                 "persona_id": persona_id,
+                "question_text": final_text,
+                "cot_log": "\n\n".join(cot_parts),
+                "random_seed": random_seed,
+                "dedup_hash": dh,
+                "quality_flags": quality_flags,
+            })
+            return "done"
+
+        except Exception as e:
+            logger.exception("Generation failed for persona_id=%d", persona_id)
+            # Decide retry vs dead-letter based on prior attempts.
+            attempts = (persona.get("attempts") or 0) + 1
+            await asyncio.to_thread(_db_increment_attempt, persona_id)
+            if attempts >= GEN_CONFIG["max_attempts"]:
+                await asyncio.to_thread(_db_mark_failed, persona_id, str(e))
+                return "failed"
+            return "retry"
+
+
+# ─── DB thread helpers (borrow/return pooled connections) ────────────────────
+
+def _db_increment_attempt(persona_id):
+    conn = db.get_connection()
+    try:
+        db.increment_attempt(conn, persona_id)
+    finally:
+        db.put_connection(conn)
+
+
+def _db_mark_failed(persona_id, error):
+    conn = db.get_connection()
+    try:
+        db.mark_failed(conn, persona_id, error)
+    finally:
+        db.put_connection(conn)
+
+
+def _db_save(item):
+    conn = db.get_connection()
+    try:
+        db.save_question(conn, item["persona_id"], item["question_text"],
+                         item["cot_log"], item["random_seed"],
+                         dedup_hash=item["dedup_hash"],
+                         quality_flags=item["quality_flags"])
+    finally:
+        db.put_connection(conn)
+
+
+# ─── Single writer task ──────────────────────────────────────────────────────
+
+async def _writer(queue: asyncio.Queue, stats: dict):
+    """Consume results and persist them to DB + CSV, serially (no races)."""
+    while True:
+        item = await queue.get()
+        if item is _STOP:
+            queue.task_done()
+            break
+        try:
+            await asyncio.to_thread(_db_save, item)
+            persona = item["persona"]
+            db.append_to_csv({
+                "persona_id": item["persona_id"],
                 "age": persona.get("age"),
                 "gender": persona.get("gender"),
                 "location": persona.get("location"),
                 "profession": persona.get("profession"),
                 "social_status": persona.get("social_status"),
                 "backstory": persona.get("backstory", ""),
-                "question_text": question_text,
-                "cot_log": full_cot_log[:500],  # Truncate for CSV readability
-                "random_seed": random_seed,
+                "question_text": item["question_text"],
+                "cot_log": item["cot_log"][:500],
+                "random_seed": item["random_seed"],
                 "created_at": datetime.now().isoformat(),
-            }
-            db.append_to_csv(csv_row)
-
-            logger.info("✓ persona_id=%d — question saved (rewrites: %d)",
-                        persona_id, rewrite_count)
-            return True
-
+            })
+            stats["success"] += 1
+            if item["quality_flags"].get("duplicate"):
+                stats["duplicates"] += 1
         except Exception:
-            logger.exception("✗ Failed to generate for persona_id=%d", persona_id)
-            return False
+            logger.exception("Writer failed to persist persona_id=%d", item["persona_id"])
+            stats["write_errors"] += 1
+        finally:
+            queue.task_done()
 
 
-async def run(batch_size: int = 50):
+# ─── Progress reporter ───────────────────────────────────────────────────────
+
+def _fmt_eta(seconds: float) -> str:
+    """Format seconds as H:MM:SS (or '—' if unknown)."""
+    if seconds is None or seconds != seconds or seconds == float("inf"):
+        return "—"
+    seconds = int(seconds)
+    h, rem = divmod(seconds, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+async def _progress(stats: dict, total: int, start: float,
+                    interval: float = 10.0):
     """
-    Main generation loop — processes all unprocessed personas in batches.
+    Periodically emit a single progress line: count/total, %, rate, ETA.
 
-    Fetches batches of unprocessed personas from the database, generates
-    questions for each using async concurrency (limited by semaphore),
-    and continues until no unprocessed personas remain.
-
-    The `processed` flag ensures safe pause/resume across script restarts.
-
-    Args:
-        batch_size: Number of concurrent personas to process per batch.
-                    Also used as the semaphore limit.
+    Runs until cancelled. `total` is the number of personas pending at start.
     """
+    while True:
+        await asyncio.sleep(interval)
+        done = stats["success"] + stats["failed"]
+        elapsed = max(time.monotonic() - start, 1e-6)
+        rate = done / elapsed
+        remaining = max(total - done, 0)
+        eta = remaining / rate if rate > 0 else None
+        pct = (100.0 * done / total) if total else 100.0
+        logger.info(
+            "PROGRESS %d/%d (%.1f%%) | ok=%d fail=%d dup=%d | %.2f/s | ETA %s",
+            done, total, pct, stats["success"], stats["failed"],
+            stats["duplicates"], rate, _fmt_eta(eta),
+        )
+
+
+# ─── Main loop ───────────────────────────────────────────────────────────────
+
+async def run(batch_size: int = None):
+    """Process all 'pending' personas until none remain, then terminate."""
+    batch_size = batch_size or GEN_CONFIG["concurrency"]
     logger.info("Starting question generation (batch_size=%d)...", batch_size)
 
-    # Use a semaphore to limit concurrent LLM calls
+    db.init_pool()
     semaphore = asyncio.Semaphore(batch_size)
+    queue: asyncio.Queue = asyncio.Queue(maxsize=batch_size * 2)
+    seen_hashes: set = set()
+    stats = {"success": 0, "duplicates": 0, "write_errors": 0,
+             "retry": 0, "failed": 0}
 
-    # Create a shared DB connection for the main loop
-    conn = db.get_connection()
+    writer_task = asyncio.create_task(_writer(queue, stats))
+    fetch_conn = db.get_connection()
 
-    total_processed = 0
-    total_success = 0
-    total_failed = 0
+    # Total work to do = personas pending at the start of this run.
+    total = await asyncio.to_thread(db.count_personas, fetch_conn, "pending")
+    logger.info("Personas to process this run: %d", total)
+    start = time.monotonic()
+    progress_task = asyncio.create_task(_progress(stats, total, start))
 
+    batch_no = 0
     try:
         async with aiohttp.ClientSession() as session:
             while True:
-                # Fetch next batch of unprocessed personas
-                personas = db.fetch_unprocessed_personas(conn, batch_size)
-
+                personas = await asyncio.to_thread(db.fetch_pending, fetch_conn, batch_size)
                 if not personas:
-                    logger.info("No more unprocessed personas. Generation complete.")
+                    logger.info("No more pending personas. Complete.")
                     break
 
-                logger.info("Processing batch of %d personas (total so far: %d)",
-                            len(personas), total_processed)
-
-                # Create tasks for each persona in the batch
-                # Each persona gets its own DB connection for transactional safety
-                tasks = []
-                persona_conns = []
-                for persona in personas:
-                    p_conn = db.get_connection()
-                    persona_conns.append(p_conn)
-                    task = generate_for_persona(session, semaphore, persona, p_conn)
-                    tasks.append(task)
-
-                # Run all tasks concurrently
+                tasks = [generate_for_persona(session, semaphore, p, queue, seen_hashes)
+                         for p in personas]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if r == "retry":
+                        stats["retry"] += 1
+                    elif r == "failed":
+                        stats["failed"] += 1
 
-                # Close per-persona connections
-                for p_conn in persona_conns:
-                    try:
-                        p_conn.close()
-                    except Exception:
-                        pass
-
-                # Tally results
-                for result in results:
-                    total_processed += 1
-                    if isinstance(result, Exception):
-                        total_failed += 1
-                        logger.error("Task exception: %s", result)
-                    elif result:
-                        total_success += 1
-                    else:
-                        total_failed += 1
-
-                logger.info("Batch complete. Success: %d, Failed: %d, Total: %d",
-                            total_success, total_failed, total_processed)
-
+                batch_no += 1
+                done = stats["success"] + stats["failed"]
+                logger.info("Batch %d done | %d/%d | ok=%d fail=%d dup=%d",
+                            batch_no, done, total, stats["success"],
+                            stats["failed"], stats["duplicates"])
     finally:
-        conn.close()
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
+        await queue.put(_STOP)
+        await writer_task
+        db.put_connection(fetch_conn)
+        db.close_pool()
 
-    logger.info("=== GENERATION COMPLETE ===")
-    logger.info("Total processed: %d | Success: %d | Failed: %d",
-                total_processed, total_success, total_failed)
+    elapsed = time.monotonic() - start
+    logger.info("=== COMPLETE in %s === ok=%d dup=%d failed=%d write_errors=%d",
+                _fmt_eta(elapsed), stats["success"], stats["duplicates"],
+                stats["failed"], stats["write_errors"])
+    return stats

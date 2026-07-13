@@ -1,22 +1,31 @@
 """
 db.py — PostgreSQL Database Helpers
 
-Provides connection management, table initialisation, transactional inserts
-for personas and generated questions, and CSV backup appending.
+Provides a shared ThreadedConnectionPool, table initialisation + schema
+migration, transactional inserts for personas and generated questions, a
+status-driven fetch (pending → done/failed) with a dead-letter path, and a
+single-writer CSV backup.
 
-All write operations use explicit BEGIN/COMMIT/ROLLBACK for data integrity
-across long-running 25,000-record generation runs.
+All write operations use explicit commit/rollback for data integrity across
+long-running 25,000-record generation runs.
+
+Concurrency notes:
+  * LLM calls run under asyncio; DB work is dispatched to a thread pool via the
+    ThreadedConnectionPool so many coroutines can share a bounded set of
+    connections instead of one connection per persona.
+  * CSV appends are NOT thread-safe. They must only be called from the single
+    writer task in question_generator.py.
 """
 
 import csv
 import os
 import logging
-from datetime import datetime
 
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 
-from config import DB_CONFIG
+from config import DB_CONFIG, GEN_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -46,16 +55,37 @@ CREATE TABLE IF NOT EXISTS personas (
 );
 """
 
-CREATE_QUESTIONS_TABLE = """
-CREATE TABLE IF NOT EXISTS generated_questions (
+# NOTE: this database (gov_spider_db) is shared with another project that owns a
+# differently-shaped `generated_questions` table. We use a dedicated table name
+# so the two never collide.
+QUESTIONS_TABLE = "hlq_questions"
+
+CREATE_QUESTIONS_TABLE = f"""
+CREATE TABLE IF NOT EXISTS {QUESTIONS_TABLE} (
     question_id  SERIAL PRIMARY KEY,
     persona_id   INT REFERENCES personas(persona_id),
     question_text TEXT,
     cot_log      TEXT,
     random_seed  INT,
+    dedup_hash   TEXT,
+    quality_flags JSONB,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
+
+# Schema migration — additive columns introduced by the reworked engine.
+# Each runs independently and is safe to re-apply.
+MIGRATIONS = [
+    "ALTER TABLE personas ADD COLUMN IF NOT EXISTS status VARCHAR(20) DEFAULT 'pending';",
+    "ALTER TABLE personas ADD COLUMN IF NOT EXISTS attempts INT DEFAULT 0;",
+    "ALTER TABLE personas ADD COLUMN IF NOT EXISTS error TEXT;",
+    # Backfill status from the legacy `processed` boolean.
+    "UPDATE personas SET status = 'done' WHERE processed = TRUE AND status = 'pending';",
+    f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS dedup_hash TEXT;",
+    f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS quality_flags JSONB;",
+    "CREATE INDEX IF NOT EXISTS idx_personas_status ON personas(status);",
+    f"CREATE INDEX IF NOT EXISTS idx_hlq_dedup ON {QUESTIONS_TABLE}(dedup_hash);",
+]
 
 INSERT_PERSONA = """
 INSERT INTO personas (age, gender, location, profession, social_status, backstory, json_metadata)
@@ -63,40 +93,77 @@ VALUES (%(age)s, %(gender)s, %(location)s, %(profession)s, %(social_status)s, %(
 RETURNING persona_id;
 """
 
-FETCH_UNPROCESSED = """
-SELECT persona_id, age, gender, location, profession, social_status, backstory, json_metadata
+# Only fetch personas that still need work. Locking SKIP LOCKED keeps concurrent
+# fetchers from grabbing the same rows if the engine is ever sharded.
+FETCH_PENDING = """
+SELECT persona_id, age, gender, location, profession, social_status, backstory, json_metadata, attempts
 FROM personas
-WHERE processed = FALSE
+WHERE status = 'pending'
 ORDER BY persona_id
 LIMIT %s;
 """
 
-INSERT_QUESTION = """
-INSERT INTO generated_questions (persona_id, question_text, cot_log, random_seed)
-VALUES (%s, %s, %s, %s);
+INSERT_QUESTION = f"""
+INSERT INTO {QUESTIONS_TABLE} (persona_id, question_text, cot_log, random_seed, dedup_hash, quality_flags)
+VALUES (%s, %s, %s, %s, %s, %s);
 """
 
-MARK_PROCESSED = """
-UPDATE personas SET processed = TRUE WHERE persona_id = %s;
-"""
+MARK_DONE = "UPDATE personas SET status = 'done', processed = TRUE WHERE persona_id = %s;"
+MARK_FAILED = "UPDATE personas SET status = 'failed', error = %s WHERE persona_id = %s;"
+INCREMENT_ATTEMPT = "UPDATE personas SET attempts = attempts + 1 WHERE persona_id = %s;"
 
 
-# ─── Connection ──────────────────────────────────────────────────────────────
+# ─── Connection Pool ─────────────────────────────────────────────────────────
+
+_POOL: ThreadedConnectionPool | None = None
+
+
+def init_pool():
+    """Create the global ThreadedConnectionPool (idempotent)."""
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadedConnectionPool(
+            GEN_CONFIG["pool_min"], GEN_CONFIG["pool_max"], **DB_CONFIG
+        )
+        logger.info("Initialised DB connection pool (min=%d, max=%d) for '%s'",
+                    GEN_CONFIG["pool_min"], GEN_CONFIG["pool_max"], DB_CONFIG["dbname"])
+    return _POOL
+
+
+def close_pool():
+    """Close all pooled connections."""
+    global _POOL
+    if _POOL is not None:
+        _POOL.closeall()
+        _POOL = None
+        logger.info("Closed DB connection pool.")
+
 
 def get_connection():
-    """Return a new psycopg2 connection using DB_CONFIG."""
-    conn = psycopg2.connect(**DB_CONFIG)
-    logger.info("Connected to PostgreSQL database '%s'", DB_CONFIG["dbname"])
-    return conn
+    """
+    Return a connection.
+
+    If the pool is initialised, borrow from it; callers MUST return it via
+    put_connection(). If not, fall back to a standalone connection (used by
+    one-shot CLI actions like --init-db and --gen-personas).
+    """
+    if _POOL is not None:
+        return _POOL.getconn()
+    return psycopg2.connect(**DB_CONFIG)
 
 
-# ─── Table Initialisation ───────────────────────────────────────────────────
+def put_connection(conn):
+    """Return a connection to the pool, or close it if pooling is disabled."""
+    if _POOL is not None:
+        _POOL.putconn(conn)
+    else:
+        conn.close()
+
+
+# ─── Table Initialisation & Migration ────────────────────────────────────────
 
 def init_tables():
-    """
-    Create the personas and generated_questions tables if they don't exist.
-    Also initialises the CSV backup file with headers if it doesn't exist.
-    """
+    """Create base tables (if absent) and initialise the CSV backup."""
     conn = get_connection()
     try:
         with conn.cursor() as cur:
@@ -109,10 +176,26 @@ def init_tables():
         logger.exception("Failed to initialise database tables.")
         raise
     finally:
-        conn.close()
+        put_connection(conn)
 
-    # Initialise CSV with headers if it doesn't exist
     _init_csv()
+
+
+def migrate():
+    """Apply additive schema migrations (status/attempts/error/dedup columns)."""
+    conn = get_connection()
+    try:
+        with conn.cursor() as cur:
+            for stmt in MIGRATIONS:
+                cur.execute(stmt)
+        conn.commit()
+        logger.info("Applied %d schema migrations.", len(MIGRATIONS))
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to apply schema migrations.")
+        raise
+    finally:
+        put_connection(conn)
 
 
 def _init_csv():
@@ -127,17 +210,7 @@ def _init_csv():
 # ─── Persona Operations ─────────────────────────────────────────────────────
 
 def insert_persona(conn, persona: dict) -> int:
-    """
-    Transactionally insert a single persona into the personas table.
-
-    Args:
-        conn: Active psycopg2 connection.
-        persona: Dict with keys: age, gender, location, profession,
-                 social_status, backstory, json_metadata.
-
-    Returns:
-        The generated persona_id.
-    """
+    """Transactionally insert a single persona; returns the new persona_id."""
     try:
         with conn.cursor() as cur:
             cur.execute(INSERT_PERSONA, persona)
@@ -150,43 +223,93 @@ def insert_persona(conn, persona: dict) -> int:
         raise
 
 
-def fetch_unprocessed_personas(conn, batch_size: int) -> list[dict]:
+def bulk_insert_personas(conn, personas: list[dict]):
     """
-    Fetch a batch of unprocessed personas from the database.
+    Bulk-insert personas using execute_values for speed at 25k scale.
 
     Args:
-        conn: Active psycopg2 connection.
-        batch_size: Maximum number of personas to fetch.
-
-    Returns:
-        List of persona dicts with keys matching the table columns.
+        conn: Active connection.
+        personas: List of persona dicts (same keys as insert_persona).
     """
+    rows = [
+        (p["age"], p["gender"], p["location"], p["profession"],
+         p["social_status"], p["backstory"], p["json_metadata"])
+        for p in personas
+    ]
+    try:
+        with conn.cursor() as cur:
+            psycopg2.extras.execute_values(
+                cur,
+                "INSERT INTO personas (age, gender, location, profession, "
+                "social_status, backstory, json_metadata) VALUES %s",
+                rows,
+                page_size=500,
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Bulk persona insert failed (%d rows).", len(rows))
+        raise
+
+
+def count_personas(conn, status: str = None) -> int:
+    """Count personas, optionally filtered by status."""
+    with conn.cursor() as cur:
+        if status is None:
+            cur.execute("SELECT COUNT(*) FROM personas;")
+        else:
+            cur.execute("SELECT COUNT(*) FROM personas WHERE status = %s;", (status,))
+        return cur.fetchone()[0]
+
+
+def fetch_pending(conn, batch_size: int) -> list[dict]:
+    """Fetch up to `batch_size` personas whose status is 'pending'."""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(FETCH_UNPROCESSED, (batch_size,))
+        cur.execute(FETCH_PENDING, (batch_size,))
         rows = cur.fetchall()
     return [dict(row) for row in rows]
 
 
-# ─── Question Operations ────────────────────────────────────────────────────
-
-def save_question(conn, persona_id: int, question_text: str, cot_log: str, random_seed: int):
-    """
-    Transactionally insert a generated question and mark the persona as processed.
-
-    Uses BEGIN/COMMIT/ROLLBACK to ensure both the question insert and the
-    persona status update happen atomically.
-
-    Args:
-        conn: Active psycopg2 connection.
-        persona_id: The persona this question was generated for.
-        question_text: The final generated question text.
-        cot_log: The Chain-of-Thought reflection log.
-        random_seed: The random seed used for generation.
-    """
+def increment_attempt(conn, persona_id: int):
+    """Increment the retry counter for a persona (committed immediately)."""
     try:
         with conn.cursor() as cur:
-            cur.execute(INSERT_QUESTION, (persona_id, question_text, cot_log, random_seed))
-            cur.execute(MARK_PROCESSED, (persona_id,))
+            cur.execute(INCREMENT_ATTEMPT, (persona_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def mark_failed(conn, persona_id: int, error: str):
+    """Mark a persona as permanently failed (dead-letter)."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute(MARK_FAILED, (error[:2000], persona_id))
+        conn.commit()
+        logger.warning("persona_id=%d marked FAILED: %s", persona_id, error[:200])
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# ─── Question Operations ────────────────────────────────────────────────────
+
+def save_question(conn, persona_id: int, question_text: str, cot_log: str,
+                  random_seed: int, dedup_hash: str = None,
+                  quality_flags: dict = None):
+    """
+    Transactionally insert a generated question and mark the persona done.
+
+    The question insert and the persona status update commit atomically.
+    """
+    flags_json = psycopg2.extras.Json(quality_flags) if quality_flags is not None else None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(INSERT_QUESTION,
+                        (persona_id, question_text, cot_log, random_seed,
+                         dedup_hash, flags_json))
+            cur.execute(MARK_DONE, (persona_id,))
         conn.commit()
         logger.info("Saved question for persona_id=%d", persona_id)
     except Exception:
@@ -195,16 +318,15 @@ def save_question(conn, persona_id: int, question_text: str, cot_log: str, rando
         raise
 
 
-# ─── CSV Backup ──────────────────────────────────────────────────────────────
+# ─── CSV Backup (single-writer only) ─────────────────────────────────────────
 
 def append_to_csv(row: dict):
     """
-    Append a single row to the personas_questions.csv backup file.
+    Append a single row to the CSV backup.
 
-    Args:
-        row: Dict with keys matching CSV_HEADERS. Missing keys default to ''.
+    NOT thread-safe — call only from the dedicated writer task.
     """
-    _init_csv()  # Ensure the file exists with headers
+    _init_csv()
     with open(CSV_PATH, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_HEADERS, extrasaction="ignore")
         writer.writerow(row)
