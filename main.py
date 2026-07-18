@@ -21,6 +21,7 @@ from db import init_tables
 from persona_generator import generate_personas
 from question_generator import run
 from report import print_report
+import topic_report
 
 
 def setup_logging():
@@ -89,6 +90,11 @@ Examples:
         help="Print a run report (coverage, duplicates, judge-fail, non-Bengali)",
     )
     parser.add_argument(
+        "--topic-report",
+        action="store_true",
+        help="Generate topic_report.html (visual topic distribution)",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Micro-batch QA run with batch_size=100 for testing",
@@ -97,8 +103,8 @@ Examples:
     args = parser.parse_args()
 
     # Check that at least one action was requested
-    if not (args.init_db or args.migrate or args.report or args.gen_personas > 0
-            or args.generate or args.test):
+    if not (args.init_db or args.migrate or args.report or args.topic_report
+            or args.gen_personas > 0 or args.generate or args.test):
         parser.print_help()
         sys.exit(1)
 
@@ -130,6 +136,9 @@ Examples:
 
     if args.report:
         print_report()
+
+    if args.topic_report:
+        topic_report.generate()
 
 
 if __name__ == "__main__":

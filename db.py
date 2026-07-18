@@ -69,6 +69,9 @@ CREATE TABLE IF NOT EXISTS {QUESTIONS_TABLE} (
     random_seed  INT,
     dedup_hash   TEXT,
     quality_flags JSONB,
+    embedding    BYTEA,
+    opener       TEXT,
+    quality_score REAL,
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 """
@@ -83,6 +86,10 @@ MIGRATIONS = [
     "UPDATE personas SET status = 'done' WHERE processed = TRUE AND status = 'pending';",
     f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS dedup_hash TEXT;",
     f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS quality_flags JSONB;",
+    # Procedural memory columns (see docs/procedural_memory_design.md)
+    f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS embedding BYTEA;",
+    f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS opener TEXT;",
+    f"ALTER TABLE {QUESTIONS_TABLE} ADD COLUMN IF NOT EXISTS quality_score REAL;",
     "CREATE INDEX IF NOT EXISTS idx_personas_status ON personas(status);",
     f"CREATE INDEX IF NOT EXISTS idx_hlq_dedup ON {QUESTIONS_TABLE}(dedup_hash);",
 ]
@@ -93,24 +100,41 @@ VALUES (%(age)s, %(gender)s, %(location)s, %(profession)s, %(social_status)s, %(
 RETURNING persona_id;
 """
 
-# Only fetch personas that still need work. Locking SKIP LOCKED keeps concurrent
-# fetchers from grabbing the same rows if the engine is ever sharded.
+# Atomically CLAIM a batch: flip pending → processing and return the rows in one
+# statement. This is what prevents a persona being fetched (and generated) twice
+# while an earlier result is still in flight — no cross-batch barrier needed.
+# FOR UPDATE SKIP LOCKED makes it safe under concurrency.
 FETCH_PENDING = """
-SELECT persona_id, age, gender, location, profession, social_status, backstory, json_metadata, attempts
-FROM personas
-WHERE status = 'pending'
-ORDER BY persona_id
-LIMIT %s;
+WITH claimed AS (
+    SELECT persona_id FROM personas
+    WHERE status = 'pending'
+    ORDER BY persona_id
+    LIMIT %s
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE personas p SET status = 'processing'
+FROM claimed
+WHERE p.persona_id = claimed.persona_id
+RETURNING p.persona_id, p.age, p.gender, p.location, p.profession,
+          p.social_status, p.backstory, p.json_metadata, p.attempts;
 """
 
+# Reset any rows stranded in 'processing' by a previous crash back to 'pending'.
+RESET_PROCESSING = "UPDATE personas SET status = 'pending' WHERE status = 'processing';"
+
 INSERT_QUESTION = f"""
-INSERT INTO {QUESTIONS_TABLE} (persona_id, question_text, cot_log, random_seed, dedup_hash, quality_flags)
-VALUES (%s, %s, %s, %s, %s, %s);
+INSERT INTO {QUESTIONS_TABLE}
+    (persona_id, question_text, cot_log, random_seed, dedup_hash, quality_flags,
+     embedding, opener, quality_score)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
 """
 
 MARK_DONE = "UPDATE personas SET status = 'done', processed = TRUE WHERE persona_id = %s;"
 MARK_FAILED = "UPDATE personas SET status = 'failed', error = %s WHERE persona_id = %s;"
-INCREMENT_ATTEMPT = "UPDATE personas SET attempts = attempts + 1 WHERE persona_id = %s;"
+# On retry, bump the counter AND release the claim (processing → pending) so the
+# persona re-enters the pool for another attempt.
+INCREMENT_ATTEMPT = ("UPDATE personas SET attempts = attempts + 1, status = 'pending' "
+                     "WHERE persona_id = %s;")
 
 
 # ─── Connection Pool ─────────────────────────────────────────────────────────
@@ -252,6 +276,26 @@ def bulk_insert_personas(conn, personas: list[dict]):
         raise
 
 
+def fetch_memory_rows(conn) -> list[dict]:
+    """
+    Load rows needed to prime procedural memory: embedding + opener + score,
+    joined to the persona's profession/region/topic. Only rows that have an
+    embedding are returned (older rows without one are skipped).
+    """
+    sql = f"""
+        SELECT q.embedding, q.opener, q.quality_score, q.question_text,
+               p.json_metadata->>'profession' AS profession,
+               p.json_metadata->>'location'   AS region,
+               p.json_metadata->>'pain_point' AS topic
+        FROM {QUESTIONS_TABLE} q
+        JOIN personas p USING (persona_id)
+        WHERE q.embedding IS NOT NULL;
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql)
+        return [dict(r) for r in cur.fetchall()]
+
+
 def count_personas(conn, status: str = None) -> int:
     """Count personas, optionally filtered by status."""
     with conn.cursor() as cur:
@@ -263,11 +307,24 @@ def count_personas(conn, status: str = None) -> int:
 
 
 def fetch_pending(conn, batch_size: int) -> list[dict]:
-    """Fetch up to `batch_size` personas whose status is 'pending'."""
+    """
+    Atomically CLAIM up to `batch_size` pending personas (pending → processing)
+    and return them. Committed immediately so the claim is durable.
+    """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(FETCH_PENDING, (batch_size,))
         rows = cur.fetchall()
+    conn.commit()
     return [dict(row) for row in rows]
+
+
+def reset_processing(conn) -> int:
+    """Release rows stranded in 'processing' (e.g. after a crash) back to pending."""
+    with conn.cursor() as cur:
+        cur.execute(RESET_PROCESSING)
+        n = cur.rowcount
+    conn.commit()
+    return n
 
 
 def increment_attempt(conn, persona_id: int):
@@ -297,18 +354,22 @@ def mark_failed(conn, persona_id: int, error: str):
 
 def save_question(conn, persona_id: int, question_text: str, cot_log: str,
                   random_seed: int, dedup_hash: str = None,
-                  quality_flags: dict = None):
+                  quality_flags: dict = None, embedding: bytes = None,
+                  opener: str = None, quality_score: float = None):
     """
     Transactionally insert a generated question and mark the persona done.
 
     The question insert and the persona status update commit atomically.
+    `embedding`/`opener`/`quality_score` back the procedural-memory subsystem
+    and may be None when memory is disabled.
     """
     flags_json = psycopg2.extras.Json(quality_flags) if quality_flags is not None else None
+    emb = psycopg2.Binary(embedding) if embedding is not None else None
     try:
         with conn.cursor() as cur:
             cur.execute(INSERT_QUESTION,
                         (persona_id, question_text, cot_log, random_seed,
-                         dedup_hash, flags_json))
+                         dedup_hash, flags_json, emb, opener, quality_score))
             cur.execute(MARK_DONE, (persona_id,))
         conn.commit()
         logger.info("Saved question for persona_id=%d", persona_id)

@@ -117,7 +117,35 @@ Generate the questions now IN BENGALI (বাংলা). Remember:
 /no_think"""
 
 
-def build_prompt(persona_json: dict) -> list[dict]:
+def _memory_block(memory_context: dict) -> str:
+    """
+    Render the procedural-memory additions (avoid-openers + exemplars) as a
+    prompt fragment. Returns "" when there is nothing to add, so behaviour is
+    identical to the pre-memory prompt.
+    """
+    if not memory_context:
+        return ""
+    parts = []
+    avoid = memory_context.get("avoid_openers") or []
+    if avoid:
+        joined = "\n".join(f'  - "{op}"' for op in avoid)
+        parts.append(
+            "## AVOID THESE OVERUSED OPENINGS\n"
+            "People like this have already started too many messages this way. "
+            "Start DIFFERENTLY — do not open with any of these:\n" + joined
+        )
+    exemplars = memory_context.get("exemplars") or []
+    if exemplars:
+        joined = "\n".join(f"  • {ex}" for ex in exemplars)
+        parts.append(
+            "## STYLE EXAMPLES (match the TONE, not the content)\n"
+            "Real messages from similar people on DIFFERENT topics. Copy their "
+            "raw, informal voice — never their wording or subject:\n" + joined
+        )
+    return ("\n\n" + "\n\n".join(parts)) if parts else ""
+
+
+def build_prompt(persona_json: dict, memory_context: dict = None) -> list[dict]:
     """
     Build an OpenAI-compatible messages list for question generation.
 
@@ -129,6 +157,9 @@ def build_prompt(persona_json: dict) -> list[dict]:
         persona_json: Dict containing persona details. Expected keys:
             age, gender, location, profession, social_status, education,
             pain_point, backstory, random_seed.
+        memory_context: Optional dict from MemoryStore.get_context with
+            `avoid_openers` and `exemplars`. When None/empty the prompt is
+            exactly the pre-memory prompt (backward compatible).
 
     Returns:
         List of message dicts with 'role' and 'content' keys,
@@ -168,6 +199,8 @@ def build_prompt(persona_json: dict) -> list[dict]:
         education=education,
         pain_point=pain_point,
     )
+
+    user_content += _memory_block(memory_context)
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},

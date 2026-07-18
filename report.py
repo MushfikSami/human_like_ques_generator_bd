@@ -58,6 +58,12 @@ def print_report():
             FROM {db.QUESTIONS_TABLE} WHERE dedup_hash IS NOT NULL;
         """)[0]
 
+        # Procedural-memory diversity: distinct-opener ratio
+        openers = _fetchall(conn, f"""
+            SELECT COUNT(*) total, COUNT(DISTINCT opener) distinct_openers
+            FROM {db.QUESTIONS_TABLE} WHERE opener IS NOT NULL;
+        """)[0]
+
         print("\n" + "=" * 60)
         print("  RUN REPORT")
         print("=" * 60)
@@ -78,6 +84,11 @@ def print_report():
             dr = 100 * (1 - dup["distinct_hashes"] / dup["total"])
             print(f"  hash duplicate rate: {dr:.1f}% "
                   f"({dup['distinct_hashes']} distinct / {dup['total']})")
+        if openers["total"]:
+            odr = 100 * openers["distinct_openers"] / openers["total"]
+            print(f"  distinct-opener ratio: {odr:.1f}% "
+                  f"({openers['distinct_openers']} distinct / {openers['total']}) "
+                  f"[higher = more diverse phrasing]")
 
         for field in ("location", "profession", "pain_point", "education"):
             print(f"\nTop {field} coverage:")

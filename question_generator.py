@@ -26,7 +26,8 @@ import aiohttp
 import db
 import prompt_engine
 import cot_module
-from config import LLM_CONFIG, GEN_CONFIG
+import memory_store
+from config import LLM_CONFIG, GEN_CONFIG, MEMORY_CONFIG
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,6 @@ logger = logging.getLogger(__name__)
 # answer directly and needs far less headroom. Bengali questions / judge JSON are
 # short; 800 tokens is ample.
 LLM_MAX_TOKENS = 800
-MAX_REWRITE_ATTEMPTS = 2  # in-cycle rewrites before giving the persona back for retry
 
 # Sentinel to stop the writer task.
 _STOP = object()
@@ -90,21 +90,28 @@ def _metadata(persona: dict) -> dict:
 
 # ─── Per-persona pipeline ────────────────────────────────────────────────────
 
-async def generate_for_persona(session, semaphore, persona, out_queue, seen_hashes):
+async def generate_for_persona(session, semaphore, persona, out_queue, seen_hashes,
+                                memory=None):
     """
     Generate, grade, and (on success) enqueue one persona's question.
 
     Returns one of: "done", "retry", "failed" — the run loop uses this to
     decide DB status transitions.
+
+    `memory` (optional MemoryStore) supplies procedural-memory context to the
+    prompt and a semantic near-duplicate signal that feeds the rewrite loop.
     """
     persona_id = persona["persona_id"]
     meta = _metadata(persona)
     random_seed = meta.get("random_seed", persona_id)
 
+    # Procedural-memory context (avoid-openers + exemplars) — computed once.
+    mem_ctx = memory.get_context(meta) if memory else None
+
     async with semaphore:
         try:
             # 1. Generate draft
-            messages = prompt_engine.build_prompt(persona)
+            messages = prompt_engine.build_prompt(persona, memory_context=mem_ctx)
             logger.info("Generating persona_id=%d (%s / %s)", persona_id,
                         persona.get("profession", "?"), persona.get("location", "?"))
             response = await _call_llm(session, messages, seed=random_seed)
@@ -112,37 +119,77 @@ async def generate_for_persona(session, semaphore, persona, out_queue, seen_hash
 
             cot_parts = [f"=== RAW ===\n{response}"]
 
-            # 2. Gate + judge, with in-cycle rewrites
-            final_text = draft
-            quality_flags = {}
-            for rw in range(MAX_REWRITE_ATTEMPTS + 1):
-                ok, flags = cot_module.programmatic_checks(
-                    final_text, GEN_CONFIG["min_bengali_ratio"])
-                judge_raw = await _call_llm(
-                    session, cot_module.build_cot_prompt(final_text, persona),
-                    seed=random_seed + 1000 + rw)
-                judge = cot_module.parse_judge(judge_raw)
-                quality_flags = {**flags, "judge": judge}
-                cot_parts.append(
-                    f"=== GATE {rw} ===\n{flags}\n=== JUDGE {rw} (raw) ===\n{judge_raw}\n"
-                    f"=== JUDGE {rw} (parsed) ===\n{judge}")
+            # 2. Gate + (conditional) judge, with in-cycle rewrites.
+            #    - The judge LLM call only runs when the cheap deterministic gates
+            #      already pass; a draft that fails the gate is rewritten without
+            #      wasting a judge call on it.
+            #    - We KEEP THE BEST attempt (never save a worse rewrite), ranked
+            #      by (passed, bengali_ratio).
+            #    - Embedding / near-dup happen ONCE on the final text (below), not
+            #      per iteration — far fewer embeds.
+            max_rewrites = GEN_CONFIG["max_rewrites"]
+            min_ratio = GEN_CONFIG["min_bengali_ratio"]
+            candidate = draft
+            best = None  # {"text","flags","key"}
+            for rw in range(max_rewrites + 1):
+                ok, flags = cot_module.programmatic_checks(candidate, min_ratio)
+
+                if ok:
+                    judge_raw = await _call_llm(
+                        session, cot_module.build_cot_prompt(candidate, persona),
+                        seed=random_seed + 1000 + rw)
+                    judge = cot_module.parse_judge(judge_raw)
+                    cot_parts.append(
+                        f"=== GATE {rw} ===\n{flags}\n=== JUDGE {rw} (raw) ===\n"
+                        f"{judge_raw}\n=== JUDGE {rw} (parsed) ===\n{judge}")
+                else:
+                    # Gate failed — skip the judge, we already know it needs work.
+                    judge = {"verdict": "SKIPPED", "is_bengali": False,
+                             "reasons": [f"gate fail: {flags}"]}
+                    cot_parts.append(f"=== GATE {rw} (FAIL, judge skipped) ===\n{flags}")
 
                 passed = ok and judge["verdict"] == "PASS" and judge["is_bengali"]
-                if passed or rw == MAX_REWRITE_ATTEMPTS:
+                cand_flags = {**flags, "judge": judge}
+
+                key = (1 if passed else 0, float(flags.get("bengali_ratio", 0.0)))
+                if best is None or key > best["key"]:
+                    best = {"text": candidate, "flags": cand_flags, "key": key}
+
+                if passed or rw == max_rewrites:
                     break
 
-                # rewrite
+                # Rewrite — escalate hard when the failure is romanized output.
+                lang_fail = float(flags.get("bengali_ratio", 0.0)) < min_ratio
                 problems = "; ".join(judge["reasons"]) or str(flags)
-                rewrite_msgs = cot_module.build_rewrite_prompt(final_text, problems, persona)
+                rewrite_msgs = cot_module.build_rewrite_prompt(
+                    candidate, problems, persona, lang_fail=lang_fail)
                 rw_resp = await _call_llm(session, rewrite_msgs, seed=random_seed + 2000 + rw)
-                final_text = cot_module.parse_draft(rw_resp)
-                cot_parts.append(f"=== REWRITE {rw} ===\n{rw_resp}")
+                candidate = cot_module.parse_draft(rw_resp)
+                cot_parts.append(f"=== REWRITE {rw} (lang_fail={lang_fail}) ===\n{rw_resp}")
 
-            # 3. Dedup flag
+            # Keep the best candidate across all attempts.
+            final_text = best["text"]
+            quality_flags = best["flags"]
+            cot_parts.append(f"=== SELECTED best key={best['key']} ===")
+
+            # 3. Embed ONCE (final text) — for storage + a single near-dup flag.
+            vec = None
+            near_dup = False
+            if memory:
+                vec = await asyncio.to_thread(memory.embed, final_text)
+                near_dup = memory.is_near_dup(vec, meta)
+            quality_flags["near_dup"] = near_dup
+
+            # Dedup flag (exact hash) + memory bookkeeping fields
             dh = cot_module.dedup_hash(final_text)
             is_dup = dh in seen_hashes
             seen_hashes.add(dh)
             quality_flags["duplicate"] = is_dup
+
+            emb_bytes = vec.tobytes() if vec is not None else None
+            opener = memory.opener(final_text) if memory else None
+            quality_score = (memory_store.score_from_flags(quality_flags)
+                             if memory else None)
 
             # 4. Enqueue for the single writer
             await out_queue.put({
@@ -153,6 +200,11 @@ async def generate_for_persona(session, semaphore, persona, out_queue, seen_hash
                 "random_seed": random_seed,
                 "dedup_hash": dh,
                 "quality_flags": quality_flags,
+                "embedding": emb_bytes,
+                "opener": opener,
+                "quality_score": quality_score,
+                "vec": vec,          # np array, for in-RAM memory.record
+                "meta": meta,
             })
             return "done"
 
@@ -191,14 +243,17 @@ def _db_save(item):
         db.save_question(conn, item["persona_id"], item["question_text"],
                          item["cot_log"], item["random_seed"],
                          dedup_hash=item["dedup_hash"],
-                         quality_flags=item["quality_flags"])
+                         quality_flags=item["quality_flags"],
+                         embedding=item.get("embedding"),
+                         opener=item.get("opener"),
+                         quality_score=item.get("quality_score"))
     finally:
         db.put_connection(conn)
 
 
 # ─── Single writer task ──────────────────────────────────────────────────────
 
-async def _writer(queue: asyncio.Queue, stats: dict):
+async def _writer(queue: asyncio.Queue, stats: dict, memory=None):
     """Consume results and persist them to DB + CSV, serially (no races)."""
     while True:
         item = await queue.get()
@@ -221,9 +276,15 @@ async def _writer(queue: asyncio.Queue, stats: dict):
                 "random_seed": item["random_seed"],
                 "created_at": datetime.now().isoformat(),
             })
+            # Update in-RAM procedural memory (serial → safe).
+            if memory and item.get("meta") is not None:
+                memory.record(item["meta"], item["question_text"], item.get("vec"),
+                              item.get("quality_score") or 0.0, opener=item.get("opener"))
             stats["success"] += 1
             if item["quality_flags"].get("duplicate"):
                 stats["duplicates"] += 1
+            if item["quality_flags"].get("near_dup"):
+                stats["near_dups"] = stats.get("near_dups", 0) + 1
         except Exception:
             logger.exception("Writer failed to persist persona_id=%d", item["persona_id"])
             stats["write_errors"] += 1
@@ -276,11 +337,29 @@ async def run(batch_size: int = None):
     semaphore = asyncio.Semaphore(batch_size)
     queue: asyncio.Queue = asyncio.Queue(maxsize=batch_size * 2)
     seen_hashes: set = set()
-    stats = {"success": 0, "duplicates": 0, "write_errors": 0,
+    stats = {"success": 0, "duplicates": 0, "near_dups": 0, "write_errors": 0,
              "retry": 0, "failed": 0}
 
-    writer_task = asyncio.create_task(_writer(queue, stats))
     fetch_conn = db.get_connection()
+
+    # Crash recovery: release any personas stranded in 'processing' by a
+    # previous interrupted run back to 'pending'.
+    stranded = await asyncio.to_thread(db.reset_processing, fetch_conn)
+    if stranded:
+        logger.info("Reset %d stranded 'processing' personas to pending.", stranded)
+
+    # Procedural memory: build + prime from prior questions (best-effort).
+    memory = None
+    if MEMORY_CONFIG.get("enabled"):
+        memory = memory_store.MemoryStore(MEMORY_CONFIG)
+        try:
+            await asyncio.to_thread(memory.embed, "warmup")   # load model up front
+            await asyncio.to_thread(memory.prime, fetch_conn)
+        except Exception:
+            logger.exception("Memory prime failed; continuing without memory.")
+            memory = None
+
+    writer_task = asyncio.create_task(_writer(queue, stats, memory))
 
     # Total work to do = personas pending at the start of this run.
     total = await asyncio.to_thread(db.count_personas, fetch_conn, "pending")
@@ -297,9 +376,14 @@ async def run(batch_size: int = None):
                     logger.info("No more pending personas. Complete.")
                     break
 
-                tasks = [generate_for_persona(session, semaphore, p, queue, seen_hashes)
+                tasks = [generate_for_persona(session, semaphore, p, queue,
+                                              seen_hashes, memory)
                          for p in personas]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
+
+                # No barrier needed: fetch_pending atomically claims rows
+                # (pending → processing), so the next fetch can never re-grab a
+                # persona that's still in flight. Batches pipeline freely.
                 for r in results:
                     if r == "retry":
                         stats["retry"] += 1
@@ -323,7 +407,7 @@ async def run(batch_size: int = None):
         db.close_pool()
 
     elapsed = time.monotonic() - start
-    logger.info("=== COMPLETE in %s === ok=%d dup=%d failed=%d write_errors=%d",
+    logger.info("=== COMPLETE in %s === ok=%d dup=%d near_dup=%d failed=%d write_errors=%d",
                 _fmt_eta(elapsed), stats["success"], stats["duplicates"],
-                stats["failed"], stats["write_errors"])
+                stats["near_dups"], stats["failed"], stats["write_errors"])
     return stats

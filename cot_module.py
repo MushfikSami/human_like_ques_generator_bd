@@ -53,6 +53,9 @@ def _extract_tag(text: str, tag: str) -> str | None:
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Short XML-ish tag fragments (e.g. "<p>", "</s>", "<m_draft>") left dangling by
+# a malformed model response — stripped only on the parse fallback path.
+_TAG_FRAGMENT_RE = re.compile(r"</?[a-zA-Z][\w\-]{0,30}>")
 # Reasoning-model preambles that sometimes leak when the model skips the tags.
 _REASONING_PREAMBLE_RE = re.compile(
     r"^(here'?s?\s+(a|my)\s+thinking\s+process|let me think|okay,?\s+so).*",
@@ -76,13 +79,19 @@ def parse_draft(llm_response: str) -> str:
     if all_drafts:
         return all_drafts[-1].strip()
 
-    # No tags. If the response is clearly a reasoning monologue, drop it so it
-    # doesn't get persisted as the "question".
+    # No clean pair. If it's clearly a reasoning monologue, drop it so it doesn't
+    # get persisted as the "question".
     if _REASONING_PREAMBLE_RE.match(cleaned):
         logger.warning("No <draft_questions> tags and response looks like reasoning; discarding.")
         return ""
 
-    logger.warning("No <draft_questions> tags found; using cleaned response.")
+    # Fallback: the model likely emitted a malformed/unclosed tag
+    # (e.g. "<m_draft_questions>" or an opening tag with no closer). Strip any
+    # angle-bracket fragment that mentions "draft_questions", plus stray leading
+    # tags, so tag litter never lands in the stored question.
+    cleaned = re.sub(r"<[^>]*draft_questions[^>]*>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = _TAG_FRAGMENT_RE.sub("", cleaned).strip()
+    logger.warning("No clean <draft_questions> tags; stripped tag litter from response.")
     return cleaned
 
 
@@ -276,17 +285,41 @@ Output ONLY the rewritten questions inside <draft_questions> tags.
 /no_think"""
 
 
-def build_rewrite_prompt(draft_questions: str, problems: str, persona: dict) -> list[dict]:
-    """Build a rewrite prompt when a draft fails the gates/judge."""
+# Forceful block appended when the failure is specifically that the output was
+# written in Latin letters (romanized/transliterated) instead of Bengali script.
+_LANG_ESCALATION = """
+
+⚠️ CRITICAL LANGUAGE FAILURE — the previous draft was written in ENGLISH LETTERS
+(romanized), NOT Bengali script. This is unacceptable. You MUST convert it to real
+Bengali (বাংলা) script.
+Example of the required conversion:
+  WRONG (romanized): "amar NID te naam bhul ase, thik korbo kibhabe?"
+  RIGHT (বাংলা script): "আমার NID তে নাম ভুল আছে, ঠিক করব কিভাবে?"
+Write EVERY word in বাংলা script. Only keep a few English tokens like NID, SMS,
+online, app. If ANY sentence is in Latin letters you have failed again."""
+
+
+def build_rewrite_prompt(draft_questions: str, problems: str, persona: dict,
+                         lang_fail: bool = False) -> list[dict]:
+    """
+    Build a rewrite prompt when a draft fails the gates/judge.
+
+    When `lang_fail` is True (the draft came back romanized rather than in Bengali
+    script), a forceful language-conversion escalation is appended.
+    """
     profession, location, education = _persona_fields(persona)
     user_content = REWRITE_PROMPT_TEMPLATE.format(
         problems=problems, draft=draft_questions,
         profession=profession, location=location, education=education,
     )
+    if lang_fail:
+        user_content += _LANG_ESCALATION
     return [
         {"role": "system",
          "content": "You rewrite text to sound like a real person typed it on a "
-                    "phone in Bengali (বাংলা). Output ONLY <draft_questions> tags."},
+                    "phone in Bengali (বাংলা) SCRIPT. Output ONLY <draft_questions> "
+                    "tags, and ONLY in বাংলা script (a few English words like NID/SMS "
+                    "are allowed)."},
         {"role": "user", "content": user_content},
     ]
 

@@ -1,6 +1,9 @@
 # Generated run artifacts
 generation.log
 personas_questions.csv
+topic_report.html
+topic_report_preview.png
+judge/judge_evaluations.csv
 
 # Python
 __pycache__/
